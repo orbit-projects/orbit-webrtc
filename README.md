@@ -29,7 +29,9 @@ The server replies with `{"v":1,"type":"answer","sdp":"..."}`. Version 1 uses co
 offer/answer SDP rather than trickle ICE; clients must finish local ICE gathering before sending
 their offer. The signaling socket remains open for the lifetime of the peer and is its control
 lease. Send `{"v":1,"type":"close"}` to close; disconnecting also closes the peer. Text frames
-and SDP are bounded. The server does not log SDP, candidate addresses, TURN credentials, or payloads.
+and SDP are bounded. Duplicate signaling keys and offers exceeding the configured media-section
+limit are rejected before creating an aiortc peer. The server does not log SDP, candidate addresses,
+TURN credentials, or payloads.
 
 ```python
 from aiortc import RTCDataChannel
@@ -55,7 +57,9 @@ server = WebRTCServer(
 
 `authorize` can enforce application authentication before the WebSocket upgrade. Use exact browser
 origins and a TLS-terminating ingress. Authentication, tenant isolation, room membership, and
-authorization policies remain application responsibilities.
+authorization policies remain application responsibilities. Numeric capacity settings require
+integers; peer counts, sections, channels, SDP bytes, origin lists, ICE server lists, and credential
+lengths are bounded at construction.
 
 ## Operations and maturity
 
@@ -63,7 +67,7 @@ See [architecture](docs/architecture/overview.md), [operations](docs/operations/
 [security](docs/security/overview.md), [development](docs/development/README.md), and the
 [architecture decision records](docs/architecture/adr/README.md).
 
-This package is pre-alpha. Validate browsers, codec negotiation, TURN/TLS, UDP reachability,
+This package is alpha. Validate browsers, codec negotiation, TURN/TLS, UDP reachability,
 ingress timeouts, connection drain, and load in the target environment before release. It does not
 implement an SFU, recording, transcoding, room coordination, or cross-instance signaling.
 

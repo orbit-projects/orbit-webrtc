@@ -107,8 +107,9 @@ async def test_malformed_offer_is_rejected_without_creating_peer(
 
 
 @pytest.mark.asyncio
-async def test_authorization_rejects_before_websocket_upgrade(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("authorization_result", [False, 1, None])
+async def test_authorization_requires_explicit_true_before_upgrade(
+    monkeypatch: pytest.MonkeyPatch, authorization_result: object
 ) -> None:
     from websockets.asyncio.client import connect
     from websockets.exceptions import InvalidStatus
@@ -116,7 +117,7 @@ async def test_authorization_rejects_before_websocket_upgrade(
     monkeypatch.setitem(sys.modules, "aiortc", fake_aiortc())
 
     async def deny(_headers: Any) -> bool:
-        return False
+        return authorization_result  # type: ignore[return-value]
 
     server = WebRTCServer(WebRTCSettings(port=0), authorize=deny)
     await server.start()
