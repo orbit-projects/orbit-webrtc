@@ -19,6 +19,59 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 MAX_SIGNAL_BYTES = 256 * 1024
+_MAX_ICE_URLS = 16
+_MAX_ICE_SERVERS = 16
+_MAX_ORIGINS = 64
+
+
+def _validate_integer(value: object, name: str, minimum: int, maximum: int) -> None:
+    """Require an actual bounded integer rather than a bool or in-range float."""
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer from {minimum} through {maximum}.")
+
+
+def _normalize_origin(value: str) -> tuple[str, str, int | None]:
+    """Validate an exact browser origin and normalize its scheme, host, and default port."""
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or len(value) > 512
+        or any(ord(character) <= 32 or ord(character) >= 127 for character in value)
+    ):
+        raise ValueError("each origin must be a bounded ASCII HTTP(S) origin.")
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError("each origin must be a valid HTTP(S) origin.") from None
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or "*" in hostname
+        or parsed.netloc.endswith(":")
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or not value.lower().startswith(f"{scheme}://")
+    ):
+        raise ValueError("each origin must be an exact HTTP(S) origin.")
+    if port == (80 if scheme == "http" else 443):
+        port = None
+    return scheme, hostname.lower(), port
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate signaling keys instead of silently accepting the last value."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate signaling object key")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -30,9 +83,16 @@ class ICEConfiguration:
     credential: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.urls, tuple) or not self.urls:
+        if not isinstance(self.urls, tuple) or not 1 <= len(self.urls) <= _MAX_ICE_URLS:
             raise ValueError("ICE server URLs must be a non-empty immutable tuple.")
         for url in self.urls:
+            if (
+                not isinstance(url, str)
+                or not url.isascii()
+                or not 1 <= len(url) <= 2_048
+                or any(ord(character) <= 32 or ord(character) >= 127 for character in url)
+            ):
+                raise ValueError("ICE server URLs must be bounded printable ASCII values.")
             parsed = urlsplit(url)
             if (
                 parsed.scheme not in {"stun", "stuns", "turn", "turns"}
@@ -44,8 +104,15 @@ class ICEConfiguration:
                 )
         if (self.username is None) != (self.credential is None):
             raise ValueError("TURN username and credential must be configured together.")
-        if self.username is not None and (not self.username or not self.credential):
-            raise ValueError("TURN username and credential must be non-empty.")
+        if self.username is not None and (
+            not isinstance(self.username, str)
+            or not isinstance(self.credential, str)
+            or not 1 <= len(self.username) <= 1_024
+            or not 1 <= len(self.credential) <= 4_096
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.username)
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.credential)
+        ):
+            raise ValueError("TURN credentials must be bounded text without control characters.")
 
     def __repr__(self) -> str:
         return (
@@ -73,43 +140,39 @@ class WebRTCSettings:
     ping_interval_seconds: float = 20.0
 
     def __post_init__(self) -> None:
-        if not self.host or "\x00" in self.host:
-            raise ValueError("host must be a non-empty bind address.")
         if (
-            isinstance(self.port, bool)
-            or not isinstance(self.port, int)
-            or not 0 <= self.port <= 65535
+            not isinstance(self.host, str)
+            or not self.host
+            or len(self.host) > 255
+            or any(ord(character) < 33 or ord(character) > 126 for character in self.host)
         ):
-            raise ValueError("port must be between 0 and 65535.")
-        if not self.path.startswith("/") or "?" in self.path or "#" in self.path:
-            raise ValueError("path must be an absolute path without query or fragment.")
-        if not isinstance(self.origins, tuple) or not self.origins:
+            raise ValueError("host must be a bounded printable ASCII bind address.")
+        _validate_integer(self.port, "port", 0, 65535)
+        if (
+            not isinstance(self.path, str)
+            or not self.path.startswith("/")
+            or len(self.path) > 1_024
+            or "?" in self.path
+            or "#" in self.path
+            or any(ord(character) < 33 or ord(character) > 126 for character in self.path)
+        ):
+            raise ValueError("path must be a bounded printable ASCII path without query/fragment.")
+        if not isinstance(self.origins, tuple) or not 1 <= len(self.origins) <= _MAX_ORIGINS:
             raise ValueError("origins must explicitly allow one or more browser origins.")
+        if not isinstance(self.ice_servers, tuple) or len(self.ice_servers) > _MAX_ICE_SERVERS:
+            raise ValueError(f"ice_servers must be a tuple of at most {_MAX_ICE_SERVERS} entries.")
+        origin_keys: set[tuple[str, str, int | None] | None] = set()
         for origin in self.origins:
-            if origin is None:
-                continue
-            parsed = urlsplit(origin)
-            if (
-                parsed.scheme not in {"http", "https"}
-                or not parsed.hostname
-                or parsed.path
-                or parsed.query
-                or parsed.fragment
-                or parsed.username
-                or parsed.password
-            ):
-                raise ValueError("each origin must be an exact HTTP(S) origin.")
-        if isinstance(self.max_peers, bool) or not 1 <= self.max_peers <= 4096:
-            raise ValueError("max_peers must be between 1 and 4096.")
-        if isinstance(self.max_media_sections, bool) or not 1 <= self.max_media_sections <= 64:
-            raise ValueError("max_media_sections must be between 1 and 64.")
-        if isinstance(self.max_data_channels, bool) or not 1 <= self.max_data_channels <= 256:
-            raise ValueError("max_data_channels must be between 1 and 256.")
-        if (
-            isinstance(self.max_sdp_bytes, bool)
-            or not 1024 <= self.max_sdp_bytes <= MAX_SIGNAL_BYTES
-        ):
-            raise ValueError("max_sdp_bytes must be between 1 KiB and 256 KiB.")
+            key = None if origin is None else _normalize_origin(origin)
+            if key in origin_keys:
+                raise ValueError("origins must be unique, including at most one no-Origin entry.")
+            origin_keys.add(key)
+        if any(not isinstance(item, ICEConfiguration) for item in self.ice_servers):
+            raise TypeError("ice_servers must contain ICEConfiguration values.")
+        _validate_integer(self.max_peers, "max_peers", 1, 4096)
+        _validate_integer(self.max_media_sections, "max_media_sections", 1, 64)
+        _validate_integer(self.max_data_channels, "max_data_channels", 1, 256)
+        _validate_integer(self.max_sdp_bytes, "max_sdp_bytes", 1024, MAX_SIGNAL_BYTES)
         for name in (
             "offer_timeout_seconds",
             "close_timeout_seconds",
@@ -152,6 +215,16 @@ class WebRTCServer:
         on_track: TrackCallback | None = None,
         on_data_channel: DataChannelCallback | None = None,
     ) -> None:
+        if settings is not None and not isinstance(settings, WebRTCSettings):
+            raise TypeError("settings must be a WebRTCSettings instance.")
+        for name, callback in (
+            ("authorize", authorize),
+            ("on_peer", on_peer),
+            ("on_track", on_track),
+            ("on_data_channel", on_data_channel),
+        ):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"{name} must be callable when provided.")
         self.settings = WebRTCSettings() if settings is None else settings
         self._authorize = authorize
         self._on_peer = on_peer
@@ -204,7 +277,7 @@ class WebRTCServer:
                 except Exception:
                     logger.warning("WebRTC signaling authorization callback failed")
                     allowed = False
-                if not allowed:
+                if allowed is not True:
                     return connection.respond(401, "Unauthorized\n")
             return None
 
@@ -297,7 +370,7 @@ class WebRTCServer:
                     await websocket.close(code=1003, reason="text signaling required")
                     break
                 try:
-                    message = json.loads(raw)
+                    message = json.loads(raw, object_pairs_hook=_unique_json_object)
                 except (json.JSONDecodeError, ValueError):
                     await websocket.close(code=1007, reason="invalid signaling JSON")
                     break
@@ -330,7 +403,7 @@ class WebRTCServer:
         if len(raw.encode("utf-8")) > MAX_SIGNAL_BYTES:
             raise ValueError("signaling message exceeds transport limit")
         try:
-            message = json.loads(raw)
+            message = json.loads(raw, object_pairs_hook=_unique_json_object)
         except (json.JSONDecodeError, ValueError):
             raise ValueError("signaling message is invalid") from None
         if not isinstance(message, dict) or set(message) != {"v", "type", "sdp"}:
@@ -340,6 +413,11 @@ class WebRTCServer:
             raise ValueError("signaling message is not a version 1 offer")
         if len(sdp.encode("utf-8")) > self.settings.max_sdp_bytes:
             raise ValueError("SDP exceeds configured limit")
+        if (
+            sum(line.startswith("m=") for line in sdp.splitlines())
+            > self.settings.max_media_sections
+        ):
+            raise ValueError("SDP exceeds configured media section limit")
         return sdp
 
     def _wire_callbacks(self, peer: PeerSession) -> None:
